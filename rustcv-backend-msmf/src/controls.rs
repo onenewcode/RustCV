@@ -28,7 +28,10 @@ unsafe impl Sync for MsmfSensor {}
 impl SensorControl for MsmfSensor {
     fn set_exposure(&self, value_us: u32) -> Result<()> {
         unsafe {
-            if let Ok(media_type) = self.source_reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32) {
+            if let Ok(media_type) = self
+                .source_reader
+                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+            {
                 let _ = media_type.SetUINT64(&MF_MT_VIDEO_LIGHTING, value_us as u64);
             }
         }
@@ -37,7 +40,10 @@ impl SensorControl for MsmfSensor {
 
     fn get_exposure(&self) -> Result<u32> {
         unsafe {
-            if let Ok(media_type) = self.source_reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32) {
+            if let Ok(media_type) = self
+                .source_reader
+                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+            {
                 if let Ok(value) = media_type.GetUINT64(&MF_MT_VIDEO_LIGHTING) {
                     return Ok(value as u32);
                 }
@@ -57,7 +63,10 @@ unsafe impl Sync for MsmfLens {}
 impl LensControl for MsmfLens {
     fn set_zoom(&self, zoom: u32) -> Result<()> {
         unsafe {
-            if let Ok(media_type) = self.source_reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32) {
+            if let Ok(media_type) = self
+                .source_reader
+                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+            {
                 let _ = media_type.SetUINT64(&MF_MT_VIDEO_LIGHTING, zoom as u64);
             }
         }
@@ -66,7 +75,10 @@ impl LensControl for MsmfLens {
 
     fn set_focus(&self, focus: u32) -> Result<()> {
         unsafe {
-            if let Ok(media_type) = self.source_reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32) {
+            if let Ok(media_type) = self
+                .source_reader
+                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+            {
                 let _ = media_type.SetUINT64(&MF_MT_VIDEO_LIGHTING, focus as u64);
             }
         }
@@ -99,7 +111,10 @@ impl SystemControl for MsmfSystem {
         let mut exposure = None;
 
         unsafe {
-            if let Ok(media_type) = self.source_reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32) {
+            if let Ok(media_type) = self
+                .source_reader
+                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+            {
                 if let Ok(value) = media_type.GetUINT64(&MF_MT_VIDEO_LIGHTING) {
                     exposure = Some(value as u32);
                 }

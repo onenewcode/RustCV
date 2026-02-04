@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok();
     }
-    
+
     tracing_subscriber::fmt::init();
 
     println!("=== RustCV Dual Camera Demo ===");
@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
     task1.abort();
     task2.abort();
     println!("Exiting...");
-    
+
     unsafe {
         CoUninitialize();
     }

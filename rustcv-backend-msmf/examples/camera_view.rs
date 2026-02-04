@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok();
     }
-    
+
     tracing_subscriber::fmt::init();
 
     println!("=== RustCV MSMF Backend Demo ===");
@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
 
     stream.stop().await?;
     println!("Stream stopped.");
-    
+
     unsafe {
         CoUninitialize();
     }
@@ -116,10 +116,10 @@ async fn main() -> Result<()> {
 
 fn dump_capabilities(dev_path: &str) -> anyhow::Result<()> {
     println!("--- Inspecting capabilities for: {} ---", dev_path);
-    
+
     let driver = MsmfDriver::new();
     let devices = driver.list_devices()?;
-    
+
     if let Some(dev) = devices.iter().find(|d| d.id == dev_path) {
         println!("Device: {} ({})", dev.name, dev.id);
         println!("Backend: {}", dev.backend);

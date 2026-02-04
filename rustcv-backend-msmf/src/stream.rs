@@ -80,30 +80,56 @@ impl Stream for MsmfStream {
                         Some(&mut timestamp),
                         Some(&mut sample),
                     )
-                    .map_err(|e| CameraError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+                    .map_err(|e| {
+                        CameraError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        ))
+                    })?;
 
                 if sample.is_some() {
                     break;
                 }
-                
+
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
-            let sample = sample.ok_or_else(|| {
-                CameraError::Io(std::io::Error::other("No sample received"))
+            let sample = sample
+                .ok_or_else(|| CameraError::Io(std::io::Error::other("No sample received")))?;
+
+            let media_buffer = sample.GetBufferByIndex(0).map_err(|e| {
+                CameraError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
             })?;
 
-            let media_buffer = sample.GetBufferByIndex(0).map_err(|e| CameraError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
-            
             let mut data_ptr = std::ptr::null_mut();
             let mut current_length = 0u32;
             let mut max_length = 0u32;
-            
-            media_buffer.Lock(&mut data_ptr, Some(&mut max_length), Some(&mut current_length)).map_err(|e| CameraError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
-            
-            self.frame_data = std::slice::from_raw_parts(data_ptr as *const u8, current_length as usize).to_vec();
-            
-            media_buffer.Unlock().map_err(|e| CameraError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+
+            media_buffer
+                .Lock(
+                    &mut data_ptr,
+                    Some(&mut max_length),
+                    Some(&mut current_length),
+                )
+                .map_err(|e| {
+                    CameraError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?;
+
+            self.frame_data =
+                std::slice::from_raw_parts(data_ptr as *const u8, current_length as usize).to_vec();
+
+            media_buffer.Unlock().map_err(|e| {
+                CameraError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
 
             timestamp
         };
