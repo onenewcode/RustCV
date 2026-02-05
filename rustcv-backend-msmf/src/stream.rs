@@ -1,3 +1,6 @@
+//! This module implements the `Stream` trait for the MSMF backend, providing the
+//! core functionality for capturing video frames from a camera.
+
 use std::sync::Arc;
 use std::time::Instant;
 use windows::Win32::Media::MediaFoundation::*;
@@ -9,12 +12,15 @@ use rustcv_core::frame::{BackendBufferHandle, Frame, FrameMetadata, Timestamp};
 use rustcv_core::time::ClockSynchronizer;
 use rustcv_core::traits::Stream;
 
+/// A marker struct for MSMF-specific buffer handles.
 #[derive(Debug)]
 pub struct MsmfBufferHandle;
 impl BackendBufferHandle for MsmfBufferHandle {}
 
+/// A static instance of the `MsmfBufferHandle`.
 static MSMF_HANDLE_INSTANCE: MsmfBufferHandle = MsmfBufferHandle;
 
+/// Represents a video stream from an MSMF camera device.
 pub struct MsmfStream {
     source_reader: Arc<IMFSourceReader>,
     width: u32,
@@ -29,6 +35,7 @@ pub struct MsmfStream {
 unsafe impl Send for MsmfStream {}
 
 impl MsmfStream {
+    /// Creates a new `MsmfStream`.
     pub fn new(
         source_reader: Arc<IMFSourceReader>,
         fmt: &super::device::NegotiatedFormat,
@@ -39,7 +46,7 @@ impl MsmfStream {
             width: fmt.width,
             height: fmt.height,
             format: fmt.format,
-            clock_sync: ClockSynchronizer::new(30),
+            clock_sync: ClockSynchronizer::new(30), // TODO: Use actual FPS
             is_streaming: false,
             sequence: 0,
             frame_data: Vec::new(),
@@ -49,16 +56,23 @@ impl MsmfStream {
 
 #[async_trait]
 impl Stream for MsmfStream {
+    /// Starts the video stream.
     async fn start(&mut self) -> Result<()> {
         self.is_streaming = true;
         Ok(())
     }
 
+    /// Stops the video stream.
     async fn stop(&mut self) -> Result<()> {
         self.is_streaming = false;
         Ok(())
     }
 
+    /// Retrieves the next frame from the stream.
+    ///
+    /// This function blocks until a new frame is available from the camera. It reads
+    /// a sample from the source reader, extracts the frame data, and constructs a
+    /// `Frame` object with synchronized timestamps.
     async fn next_frame(&mut self) -> Result<Frame<'_>> {
         if !self.is_streaming {
             return Err(CameraError::Io(std::io::Error::other("Stream not started")));
@@ -70,6 +84,7 @@ impl Stream for MsmfStream {
             let mut timestamp = 0i64;
             let mut sample = None;
 
+            // Retry reading a sample a few times, as it might not be immediately available.
             for _ in 0..10 {
                 self.source_reader
                     .ReadSample(
@@ -97,6 +112,7 @@ impl Stream for MsmfStream {
             let sample = sample
                 .ok_or_else(|| CameraError::Io(std::io::Error::other("No sample received")))?;
 
+            // Get the media buffer from the sample.
             let media_buffer = sample.GetBufferByIndex(0).map_err(|e| {
                 CameraError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -108,6 +124,7 @@ impl Stream for MsmfStream {
             let mut current_length = 0u32;
             let mut max_length = 0u32;
 
+            // Lock the buffer to access the frame data.
             media_buffer
                 .Lock(
                     &mut data_ptr,
@@ -121,9 +138,11 @@ impl Stream for MsmfStream {
                     ))
                 })?;
 
+            // Copy the frame data into our own buffer.
             self.frame_data =
                 std::slice::from_raw_parts(data_ptr as *const u8, current_length as usize).to_vec();
 
+            // Unlock the buffer.
             media_buffer.Unlock().map_err(|e| {
                 CameraError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -135,6 +154,7 @@ impl Stream for MsmfStream {
         };
 
         let arrival_time = Instant::now();
+        // The MSMF timestamp is in 100-nanosecond units.
         let hw_ns = (timestamp as u64) * 100;
         let synced_time = self.clock_sync.correct(hw_ns, arrival_time);
 
@@ -165,6 +185,7 @@ impl Stream for MsmfStream {
         Ok(frame)
     }
 
+    /// Injects a simulated frame into the stream (not supported by this backend).
     #[cfg(feature = "simulation")]
     async fn inject_frame(&mut self, _frame: Frame<'_>) -> Result<()> {
         Err(CameraError::SimulationError(
