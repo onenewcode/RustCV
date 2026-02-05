@@ -27,25 +27,43 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
     // The resources are carefully managed to prevent leaks.
     unsafe {
         // Create an attribute store to specify the type of devices we want to enumerate.
-        let attributes = create_video_capture_attributes()?;
+        let mut attributes = None;
+        MFCreateAttributes(&mut attributes, 1).map_err(hresult_to_camera_error)?;
+        let attributes = attributes
+            .ok_or_else(|| CameraError::Io(std::io::Error::other("Failed to create attributes")))?;
 
-        let mut pp_devices: *mut Option<IMFActivate> = std::ptr::null_mut();
+        // Set the attribute to filter for video capture devices.
+        attributes
+            .SetGUID(
+                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+            )
+            .map_err(hresult_to_camera_error)?;
+
+        let mut pp_devices: MaybeUninit<*mut Option<IMFActivate>> = MaybeUninit::uninit();
         let mut count: u32 = 0;
         // Enumerate devices of the specified type.
         MFEnumDeviceSources(&attributes, &mut pp_devices, &mut count)
             .map_err(hresult_to_camera_error)?;
 
-        if count == 0 || pp_devices.is_null() {
+        if count == 0 {
             return Ok(Vec::new());
         }
 
         // Convert the raw C-style array of COM pointers into a Rust slice.
         let devices_slice = std::slice::from_raw_parts_mut(pp_devices, count as usize);
 
+        // TODO
+        //    unsafe { from_raw_parts(unused_mf_activate.assume_init(), count as usize) }
+        // .iter()
+        // .for_each(|pointer| {
+        //     if let Some(imf_activate) = pointer {
+        //         device_list.push(imf_activate.clone());
+        //     }
+        // });
         // Iterate over the devices, extract their information, and collect them into a Vec.
         let devices = devices_slice
             .iter_mut()
-            // `take()` transfers ownership of the `IMFActivate` object, preventing double-freeing.
             .filter_map(|opt| opt.take())
             .filter_map(|device| {
                 let name = get_attribute_string(&device, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
@@ -71,23 +89,6 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
 
         Ok(devices)
     }
-}
-
-/// Creates an `IMFAttributes` object configured to search for video capture devices.
-unsafe fn create_video_capture_attributes() -> Result<IMFAttributes> {
-    let mut attributes = None;
-    MFCreateAttributes(&mut attributes, 1).map_err(hresult_to_camera_error)?;
-    let attributes = attributes
-        .ok_or_else(|| CameraError::Io(std::io::Error::other("Failed to create attributes")))?;
-
-    // Set the attribute to filter for video capture devices.
-    attributes
-        .SetGUID(
-            &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-            &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-        )
-        .map_err(hresult_to_camera_error)?;
-    Ok(attributes)
 }
 
 /// Retrieves a string attribute from a device's `IMFActivate` interface.
@@ -184,33 +185,10 @@ unsafe fn set_output_media_type(
     source_reader: &IMFSourceReader,
     negotiated_fmt: &NegotiatedFormat,
 ) -> Result<()> {
-    // Create a new media type object.
-    let media_type = MFCreateMediaType().map_err(hresult_to_camera_error)?;
+    // 1. Create a fully configured media type object from our negotiated format.
+    let media_type = create_media_type(negotiated_fmt)?;
 
-    // Set the major type to Video.
-    media_type
-        .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-        .map_err(hresult_to_camera_error)?;
-
-    // Set the subtype to the negotiated pixel format.
-    let mf_guid =
-        pixel_map::to_mf_guid(negotiated_fmt.format).ok_or(CameraError::FormatNotSupported)?;
-    media_type
-        .SetGUID(&MF_MT_SUBTYPE, &mf_guid)
-        .map_err(hresult_to_camera_error)?;
-
-    // Set other necessary attributes like interlace mode and frame size.
-    media_type
-        .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
-        .map_err(hresult_to_camera_error)?;
-    media_type
-        .SetUINT64(
-            &MF_MT_FRAME_SIZE,
-            ((negotiated_fmt.height as u64) << 32) | (negotiated_fmt.width as u64),
-        )
-        .map_err(hresult_to_camera_error)?;
-
-    // Apply the configured media type to the source reader.
+    // 2. Apply the configured media type to the source reader's video stream.
     source_reader
         .SetCurrentMediaType(
             MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
@@ -219,12 +197,45 @@ unsafe fn set_output_media_type(
         )
         .map_err(hresult_to_camera_error)?;
 
-    // Flush the source reader to apply the changes.
+    // 3. Flush the source reader to ensure the new type is applied immediately.
     source_reader
         .Flush(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
         .map_err(hresult_to_camera_error)?;
 
     Ok(())
+}
+
+/// Creates an `IMFMediaType` object from a `NegotiatedFormat`.
+/// This function translates the high-level `NegotiatedFormat` into a low-level
+/// `IMFMediaType` object that the Windows Media Foundation API can understand.
+unsafe fn create_media_type(format: &NegotiatedFormat) -> Result<IMFMediaType> {
+    // 1. Create a blank media type object.
+    let media_type = MFCreateMediaType().map_err(hresult_to_camera_error)?;
+
+    // 2. Set the major type to Video. This is the most fundamental property.
+    media_type
+        .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+        .map_err(hresult_to_camera_error)?;
+
+    // 3. Set the subtype to the specific pixel format (e.g., YUYV, MJPEG).
+    let mf_guid = pixel_map::to_mf_guid(format.format).ok_or(CameraError::FormatNotSupported)?;
+    media_type
+        .SetGUID(&MF_MT_SUBTYPE, &mf_guid)
+        .map_err(hresult_to_camera_error)?;
+
+    // 4. Set the video to be progressive scan (standard for modern cameras).
+    media_type
+        .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
+        .map_err(hresult_to_camera_error)?;
+
+    // 5. Set the frame size (resolution) by packing width and height into a 64-bit integer.
+    let frame_size = ((format.height as u64) << 32) | (format.width as u64);
+    media_type
+        .SetUINT64(&MF_MT_FRAME_SIZE, frame_size)
+        .map_err(hresult_to_camera_error)?;
+
+    // 6. Return the fully configured media type.
+    Ok(media_type)
 }
 
 /// Represents a video format that has been successfully negotiated with the device.
@@ -300,4 +311,29 @@ fn calculate_score(config: &CameraConfig, w: u32, h: u32, fmt: PixelFormat) -> i
 
     // Combine scores and use width as a tie-breaker, preferring higher resolutions.
     resolution_score + format_score + (w / 100) as i32
+}
+
+pub fn initialize_mf() -> Result<(), NokhwaError> {
+    if !(INITIALIZED.load(Ordering::SeqCst)) {
+        if let Err(why) =
+            unsafe { CoInitializeEx(None, CO_INIT_APARTMENT_THREADED | CO_INIT_DISABLE_OLE1DDE) }
+        {
+            return Err(NokhwaError::InitializeError {
+                backend: ApiBackend::MediaFoundation,
+                error: why.to_string(),
+            });
+        }
+
+        if let Err(why) = unsafe { MFStartup(MF_API_VERSION, MFSTARTUP_NOSOCKET) } {
+            unsafe {
+                CoUninitialize();
+            }
+            return Err(NokhwaError::InitializeError {
+                backend: ApiBackend::MediaFoundation,
+                error: why.to_string(),
+            });
+        }
+        INITIALIZED.store(true, Ordering::SeqCst);
+    }
+    Ok(())
 }

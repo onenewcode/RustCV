@@ -11,7 +11,27 @@ use rustcv_core::traits::Driver;
 #[tokio::main]
 async fn main() -> Result<()> {
     unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED).ok();
+        if !(INITIALIZED.load(Ordering::SeqCst)) {
+            if let Err(why) = unsafe {
+                CoInitializeEx(None, CO_INIT_APARTMENT_THREADED | CO_INIT_DISABLE_OLE1DDE)
+            } {
+                return Err(NokhwaError::InitializeError {
+                    backend: ApiBackend::MediaFoundation,
+                    error: why.to_string(),
+                });
+            }
+
+            if let Err(why) = unsafe { MFStartup(MF_API_VERSION, MFSTARTUP_NOSOCKET) } {
+                unsafe {
+                    CoUninitialize();
+                }
+                return Err(NokhwaError::InitializeError {
+                    backend: ApiBackend::MediaFoundation,
+                    error: why.to_string(),
+                });
+            }
+            INITIALIZED.store(true, Ordering::SeqCst);
+        }
     }
 
     tracing_subscriber::fmt::init();
