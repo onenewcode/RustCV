@@ -1,16 +1,9 @@
-//! This module provides mapping functions between MSMF-specific pixel format GUIDs
-//! and the generic `PixelFormat` enum defined in `rustcv_core`.
+#![allow(non_upper_case_globals)]
 
 use rustcv_core::pixel_format::{FourCC, PixelFormat};
 use windows::core::GUID;
 use windows::Win32::Media::MediaFoundation::*;
 
-/// Converts an MSMF video format GUID to a `PixelFormat`.
-///
-/// This function takes a GUID representing a video format in MSMF and maps it
-/// to the corresponding `PixelFormat` variant. If the GUID is not recognized,
-/// it returns `PixelFormat::Unknown` and logs a warning.
-#[allow(non_upper_case_globals)]
 pub fn from_mf_guid(guid: &GUID) -> PixelFormat {
     match *guid {
         MFVideoFormat_YUY2 => PixelFormat::Known(FourCC::YUYV),
@@ -28,10 +21,6 @@ pub fn from_mf_guid(guid: &GUID) -> PixelFormat {
     }
 }
 
-/// Converts a `PixelFormat` to an MSMF video format GUID.
-///
-/// This function takes a `PixelFormat` and returns the corresponding MSMF GUID
-/// if a mapping exists. If there is no corresponding GUID, it returns `None`.
 pub fn to_mf_guid(fmt: PixelFormat) -> Option<GUID> {
     match fmt {
         PixelFormat::Known(FourCC::YUYV) => Some(MFVideoFormat_YUY2),

@@ -1,9 +1,3 @@
-//! This module implements the device control traits for the MSMF backend.
-//!
-//! It provides mechanisms to control camera sensor, lens, and system settings.
-//! Note that many of these controls are placeholders and may not be fully
-//! implemented by all MSMF devices.
-
 use std::sync::Arc;
 use windows::core::GUID;
 use windows::Win32::Media::MediaFoundation::*;
@@ -13,7 +7,8 @@ use rustcv_core::traits::{
     DeviceControls, LensControl, SensorControl, SystemControl, TriggerConfig, TriggerMode,
 };
 
-/// Creates a `DeviceControls` structure for the MSMF backend.
+const DEFAULT_EXPOSURE_US: u32 = 10000;
+
 pub fn create_controls(source_reader: Arc<IMFSourceReader>) -> DeviceControls {
     DeviceControls {
         sensor: Box::new(MsmfSensor {
@@ -26,7 +21,6 @@ pub fn create_controls(source_reader: Arc<IMFSourceReader>) -> DeviceControls {
     }
 }
 
-/// Helper function to get the current media type from the source reader.
 unsafe fn get_current_media_type(
     source_reader: &IMFSourceReader,
 ) -> Option<IMFMediaType> {
@@ -35,7 +29,6 @@ unsafe fn get_current_media_type(
         .ok()
 }
 
-/// Helper function to set a UINT64 attribute on the current media type.
 unsafe fn set_media_type_uint64(
     source_reader: &IMFSourceReader,
     guid: &GUID,
@@ -46,7 +39,6 @@ unsafe fn set_media_type_uint64(
     }
 }
 
-/// Helper function to get a UINT64 attribute from the current media type.
 unsafe fn get_media_type_uint64(
     source_reader: &IMFSourceReader,
     guid: &GUID,
@@ -55,7 +47,6 @@ unsafe fn get_media_type_uint64(
         .and_then(|media_type| media_type.GetUINT64(guid).ok())
 }
 
-/// A struct for controlling sensor-related properties of an MSMF camera.
 #[allow(clippy::arc_with_non_send_sync)]
 struct MsmfSensor {
     source_reader: Arc<IMFSourceReader>,
@@ -65,10 +56,6 @@ unsafe impl Send for MsmfSensor {}
 unsafe impl Sync for MsmfSensor {}
 
 impl SensorControl for MsmfSensor {
-    /// Sets the exposure time of the camera sensor.
-    ///
-    /// Note: `MF_MT_VIDEO_LIGHTING` is used here as a placeholder for exposure
-    /// control, which might not be the correct attribute for all devices.
     fn set_exposure(&self, value_us: u32) -> Result<()> {
         unsafe {
             set_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING, value_us as u64);
@@ -76,17 +63,15 @@ impl SensorControl for MsmfSensor {
         Ok(())
     }
 
-    /// Gets the current exposure time of the camera sensor.
     fn get_exposure(&self) -> Result<u32> {
         unsafe {
             Ok(get_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING)
                 .map(|v| v as u32)
-                .unwrap_or(0))
+                .unwrap_or(DEFAULT_EXPOSURE_US))
         }
     }
 }
 
-/// A struct for controlling lens-related properties of an MSMF camera.
 #[allow(clippy::arc_with_non_send_sync)]
 struct MsmfLens {
     source_reader: Arc<IMFSourceReader>,
@@ -96,9 +81,6 @@ unsafe impl Send for MsmfLens {}
 unsafe impl Sync for MsmfLens {}
 
 impl LensControl for MsmfLens {
-    /// Sets the zoom level of the camera lens.
-    ///
-    /// Note: This is a placeholder and uses a lighting attribute, which is likely incorrect.
     fn set_zoom(&self, zoom: u32) -> Result<()> {
         unsafe {
             set_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING, zoom as u64);
@@ -106,9 +88,6 @@ impl LensControl for MsmfLens {
         Ok(())
     }
 
-    /// Sets the focus of the camera lens.
-    ///
-    /// Note: This is a placeholder and uses a lighting attribute, which is likely incorrect.
     fn set_focus(&self, focus: u32) -> Result<()> {
         unsafe {
             set_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING, focus as u64);
@@ -117,7 +96,6 @@ impl LensControl for MsmfLens {
     }
 }
 
-/// A struct for controlling system-level properties of an MSMF camera.
 #[allow(clippy::arc_with_non_send_sync)]
 struct MsmfSystem {
     source_reader: Arc<IMFSourceReader>,
@@ -127,12 +105,10 @@ unsafe impl Send for MsmfSystem {}
 unsafe impl Sync for MsmfSystem {}
 
 impl SystemControl for MsmfSystem {
-    /// Resets the camera device. (Not implemented)
     unsafe fn force_reset(&self) -> Result<()> {
         Ok(())
     }
 
-    /// Configures the trigger mode of the camera. (Not supported)
     fn set_trigger(&self, config: TriggerConfig) -> Result<()> {
         if config.mode == TriggerMode::Off {
             return Ok(());
@@ -140,7 +116,6 @@ impl SystemControl for MsmfSystem {
         Err(CameraError::FormatNotSupported)
     }
 
-    /// Exports the current state of the camera.
     fn export_state(&self) -> Result<serde_json::Value> {
         use serde_json::json;
 

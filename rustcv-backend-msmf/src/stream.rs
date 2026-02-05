@@ -1,6 +1,3 @@
-//! This module implements the `Stream` trait for the MSMF backend, providing the
-//! core functionality for capturing video frames from a camera.
-
 use std::sync::Arc;
 use std::time::Instant;
 use windows::Win32::Media::MediaFoundation::*;
@@ -12,15 +9,16 @@ use rustcv_core::frame::{BackendBufferHandle, Frame, FrameMetadata, Timestamp};
 use rustcv_core::time::ClockSynchronizer;
 use rustcv_core::traits::Stream;
 
-/// A marker struct for MSMF-specific buffer handles.
+const MAX_RETRY_ATTEMPTS: u32 = 30;
+const STREAM_TIMEOUT_MS: u64 = 1;
+const DEFAULT_BUFFER_CAPACITY: usize = 640 * 480 * 4;
+
 #[derive(Debug)]
 pub struct MsmfBufferHandle;
 impl BackendBufferHandle for MsmfBufferHandle {}
 
-/// A static instance of the `MsmfBufferHandle`.
 static MSMF_HANDLE_INSTANCE: MsmfBufferHandle = MsmfBufferHandle;
 
-/// Represents a video stream from an MSMF camera device.
 pub struct MsmfStream {
     source_reader: Arc<IMFSourceReader>,
     width: u32,
@@ -30,17 +28,20 @@ pub struct MsmfStream {
     is_streaming: bool,
     sequence: u64,
     frame_data: Vec<u8>,
+    stride: usize,
 }
 
 unsafe impl Send for MsmfStream {}
 
 impl MsmfStream {
-    /// Creates a new `MsmfStream`.
     pub fn new(
         source_reader: Arc<IMFSourceReader>,
         fmt: &super::device::NegotiatedFormat,
         _buf_count: usize,
     ) -> Result<Self> {
+        let stride = (fmt.width * fmt.format.bpp_estimate() / 8) as usize;
+        let estimated_size = stride * fmt.height as usize;
+        
         Ok(Self {
             source_reader,
             width: fmt.width,
@@ -49,23 +50,22 @@ impl MsmfStream {
             clock_sync: ClockSynchronizer::new(30),
             is_streaming: false,
             sequence: 0,
-            frame_data: Vec::new(),
+            frame_data: Vec::with_capacity(estimated_size.max(DEFAULT_BUFFER_CAPACITY)),
+            stride,
         })
     }
 
-    /// Helper function to convert HResult errors to CameraError.
     fn hresult_to_camera_error(e: windows::core::Error) -> CameraError {
         CameraError::Io(std::io::Error::other(e.to_string()))
     }
 
-    /// Reads a sample from the source reader with retries.
     unsafe fn read_sample_with_retry(&self) -> Result<(IMFSample, i64)> {
         let mut stream_index = 0u32;
         let mut flags = 0u32;
         let mut timestamp = 0i64;
         let mut sample = None;
 
-        for _ in 0..30 { // More retries
+        for _ in 0..MAX_RETRY_ATTEMPTS {
             self.source_reader
                 .ReadSample(
                     MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
@@ -81,8 +81,7 @@ impl MsmfStream {
                 break;
             }
 
-            // Shorter sleep time for better responsiveness
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(std::time::Duration::from_millis(STREAM_TIMEOUT_MS));
         }
 
         let sample = sample.ok_or_else(|| {
@@ -92,7 +91,6 @@ impl MsmfStream {
         Ok((sample, timestamp))
     }
 
-    /// Extracts frame data from a media buffer.
     unsafe fn extract_frame_data(&mut self, media_buffer: &IMFMediaBuffer) -> Result<()> {
         let mut data_ptr = std::ptr::null_mut();
         let mut current_length = 0u32;
@@ -102,11 +100,11 @@ impl MsmfStream {
             .Lock(&mut data_ptr, Some(&mut max_length), Some(&mut current_length))
             .map_err(Self::hresult_to_camera_error)?;
 
-        // Resize buffer if needed instead of always allocating new
-        if self.frame_data.len() < current_length as usize {
-            self.frame_data.resize(current_length as usize, 0);
+        if self.frame_data.capacity() < current_length as usize {
+            self.frame_data.reserve(current_length as usize - self.frame_data.capacity());
         }
-        // Copy data directly instead of using to_vec()
+        
+        self.frame_data.set_len(current_length as usize);
         std::ptr::copy_nonoverlapping(
             data_ptr as *const u8,
             self.frame_data.as_mut_ptr(),
@@ -120,23 +118,16 @@ impl MsmfStream {
 
 #[async_trait]
 impl Stream for MsmfStream {
-    /// Starts the video stream.
     async fn start(&mut self) -> Result<()> {
         self.is_streaming = true;
         Ok(())
     }
 
-    /// Stops the video stream.
     async fn stop(&mut self) -> Result<()> {
         self.is_streaming = false;
         Ok(())
     }
 
-    /// Retrieves the next frame from the stream.
-    ///
-    /// This function blocks until a new frame is available from the camera. It reads
-    /// a sample from the source reader, extracts the frame data, and constructs a
-    /// `Frame` object with synchronized timestamps.
     async fn next_frame(&mut self) -> Result<Frame<'_>> {
         if !self.is_streaming {
             return Err(CameraError::Io(std::io::Error::other("Stream not started")));
@@ -169,7 +160,7 @@ impl Stream for MsmfStream {
             data: &self.frame_data,
             width: self.width,
             height: self.height,
-            stride: (self.width * self.format.bpp_estimate() / 8) as usize,
+            stride: self.stride,
             format: self.format,
             sequence: self.sequence,
             timestamp: Timestamp {
@@ -183,7 +174,6 @@ impl Stream for MsmfStream {
         Ok(frame)
     }
 
-    /// Injects a simulated frame into the stream (not supported by this backend).
     #[cfg(feature = "simulation")]
     async fn inject_frame(&mut self, _frame: Frame<'_>) -> Result<()> {
         Err(CameraError::SimulationError(
