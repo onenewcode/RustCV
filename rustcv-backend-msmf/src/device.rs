@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use windows::core::{Error as HResultError, GUID, HSTRING};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::*;
@@ -12,17 +14,19 @@ use crate::controls::create_controls;
 use crate::pixel_map;
 use crate::stream::MsmfStream;
 
+static INITIALIZED: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+static CAMERA_REFCNT: LazyLock<Arc<AtomicUsize>> = LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
+
 /// Converts a Windows HRESULT error into a `CameraError`.
 /// This simplifies error handling when interacting with the Windows API.
 fn hresult_to_camera_error(e: HResultError) -> CameraError {
-    CameraError::Io(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        e.to_string(),
-    ))
+    CameraError::Io(std::io::Error::other(e.to_string()))
 }
 
 /// Lists all available video capture devices.
 pub fn list_devices() -> Result<Vec<DeviceInfo>> {
+    initialize_mf()?;
+
     // This function interacts with COM objects, which requires `unsafe` blocks.
     // The resources are carefully managed to prevent leaks.
     unsafe {
@@ -43,7 +47,7 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
         let mut pp_devices: MaybeUninit<*mut Option<IMFActivate>> = MaybeUninit::uninit();
         let mut count: u32 = 0;
         // Enumerate devices of the specified type.
-        MFEnumDeviceSources(&attributes, &mut pp_devices, &mut count)
+        MFEnumDeviceSources(&attributes, pp_devices.as_mut_ptr(), &mut count)
             .map_err(hresult_to_camera_error)?;
 
         if count == 0 {
@@ -51,16 +55,9 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
         }
 
         // Convert the raw C-style array of COM pointers into a Rust slice.
-        let devices_slice = std::slice::from_raw_parts_mut(pp_devices, count as usize);
+        let devices_slice =
+            std::slice::from_raw_parts_mut(pp_devices.assume_init(), count as usize);
 
-        // TODO
-        //    unsafe { from_raw_parts(unused_mf_activate.assume_init(), count as usize) }
-        // .iter()
-        // .for_each(|pointer| {
-        //     if let Some(imf_activate) = pointer {
-        //         device_list.push(imf_activate.clone());
-        //     }
-        // });
         // Iterate over the devices, extract their information, and collect them into a Vec.
         let devices = devices_slice
             .iter_mut()
@@ -85,7 +82,7 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
             .collect();
 
         // Free the memory allocated by `MFEnumDeviceSources`.
-        CoTaskMemFree(Some(pp_devices as *const std::ffi::c_void));
+        CoTaskMemFree(Some(pp_devices.assume_init() as *const std::ffi::c_void));
 
         Ok(devices)
     }
@@ -113,7 +110,10 @@ unsafe fn get_attribute_string(attr: &IMFActivate, guid: GUID) -> String {
 }
 
 /// Opens a camera device by its ID and applies the given configuration.
+#[allow(clippy::arc_with_non_send_sync)]
 pub fn open(id: &str, config: CameraConfig) -> Result<(Box<dyn Stream>, DeviceControls)> {
+    initialize_mf()?;
+
     // 1. Create a source reader for the specified device.
     let source_reader = unsafe { create_source_reader(id)? };
     // 2. Negotiate the best format based on the user's configuration.
@@ -147,7 +147,6 @@ unsafe fn create_source_reader(id: &str) -> Result<IMFSourceReader> {
     let attributes = attributes
         .ok_or_else(|| CameraError::Io(std::io::Error::other("Failed to create attributes")))?;
 
-    // Specify that we want a video capture device.
     attributes
         .SetGUID(
             &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
@@ -155,7 +154,6 @@ unsafe fn create_source_reader(id: &str) -> Result<IMFSourceReader> {
         )
         .map_err(hresult_to_camera_error)?;
 
-    // Specify the device's symbolic link (its unique ID).
     let id_hstring = HSTRING::from(id);
     attributes
         .SetString(
@@ -164,20 +162,24 @@ unsafe fn create_source_reader(id: &str) -> Result<IMFSourceReader> {
         )
         .map_err(hresult_to_camera_error)?;
 
-    // Create the media source and then a source reader from it.
     let source = MFCreateDeviceSource(&attributes).map_err(hresult_to_camera_error)?;
     let source_reader =
         MFCreateSourceReaderFromMediaSource(&source, None).map_err(hresult_to_camera_error)?;
 
-    // Deselect all streams, then select only the first video stream.
+    select_video_stream(&source_reader)?;
+
+    Ok(source_reader)
+}
+
+/// Selects only the first video stream from the source reader.
+unsafe fn select_video_stream(source_reader: &IMFSourceReader) -> Result<()> {
     source_reader
         .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)
         .map_err(hresult_to_camera_error)?;
     source_reader
         .SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, true)
         .map_err(hresult_to_camera_error)?;
-
-    Ok(source_reader)
+    Ok(())
 }
 
 /// Sets the output media type on the source reader based on the negotiated format.
@@ -209,32 +211,26 @@ unsafe fn set_output_media_type(
 /// This function translates the high-level `NegotiatedFormat` into a low-level
 /// `IMFMediaType` object that the Windows Media Foundation API can understand.
 unsafe fn create_media_type(format: &NegotiatedFormat) -> Result<IMFMediaType> {
-    // 1. Create a blank media type object.
     let media_type = MFCreateMediaType().map_err(hresult_to_camera_error)?;
 
-    // 2. Set the major type to Video. This is the most fundamental property.
     media_type
         .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
         .map_err(hresult_to_camera_error)?;
 
-    // 3. Set the subtype to the specific pixel format (e.g., YUYV, MJPEG).
     let mf_guid = pixel_map::to_mf_guid(format.format).ok_or(CameraError::FormatNotSupported)?;
     media_type
         .SetGUID(&MF_MT_SUBTYPE, &mf_guid)
         .map_err(hresult_to_camera_error)?;
 
-    // 4. Set the video to be progressive scan (standard for modern cameras).
     media_type
         .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
         .map_err(hresult_to_camera_error)?;
 
-    // 5. Set the frame size (resolution) by packing width and height into a 64-bit integer.
     let frame_size = ((format.height as u64) << 32) | (format.width as u64);
     media_type
         .SetUINT64(&MF_MT_FRAME_SIZE, frame_size)
         .map_err(hresult_to_camera_error)?;
 
-    // 6. Return the fully configured media type.
     Ok(media_type)
 }
 
@@ -309,31 +305,57 @@ fn calculate_score(config: &CameraConfig, w: u32, h: u32, fmt: PixelFormat) -> i
         .find(|(req_fmt, _)| fmt == *req_fmt)
         .map_or(0, |(_, prio)| *prio as i32 * 10);
 
-    // Combine scores and use width as a tie-breaker, preferring higher resolutions.
-    resolution_score + format_score + (w / 100) as i32
+    // For non-matching resolutions, calculate distance from requested resolution
+    let resolution_distance = if resolution_score == 0 {
+        config.resolution_req
+            .iter()
+            .map(|(req_w, req_h, _)| {
+                let w_diff = (w as i32 - *req_w as i32).abs();
+                let h_diff = (h as i32 - *req_h as i32).abs();
+                -(w_diff + h_diff) // Negative score for distance
+            })
+            .max()
+            .unwrap_or(-1000)
+    } else {
+        0
+    };
+
+    // Combine scores
+    resolution_score + format_score + resolution_distance
 }
 
-pub fn initialize_mf() -> Result<(), NokhwaError> {
-    if !(INITIALIZED.load(Ordering::SeqCst)) {
-        if let Err(why) =
-            unsafe { CoInitializeEx(None, CO_INIT_APARTMENT_THREADED | CO_INIT_DISABLE_OLE1DDE) }
-        {
-            return Err(NokhwaError::InitializeError {
-                backend: ApiBackend::MediaFoundation,
-                error: why.to_string(),
-            });
-        }
+pub fn initialize_mf() -> Result<()> {
+    let initialized = &*INITIALIZED;
+    let refcnt = &*CAMERA_REFCNT;
 
-        if let Err(why) = unsafe { MFStartup(MF_API_VERSION, MFSTARTUP_NOSOCKET) } {
+    if !initialized.load(Ordering::SeqCst) {
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+            .ok()
+            .map_err(hresult_to_camera_error)?;
+
+        unsafe { MFStartup(MF_API_VERSION, MFSTARTUP_NOSOCKET) }.map_err(|e| {
             unsafe {
                 CoUninitialize();
             }
-            return Err(NokhwaError::InitializeError {
-                backend: ApiBackend::MediaFoundation,
-                error: why.to_string(),
-            });
-        }
-        INITIALIZED.store(true, Ordering::SeqCst);
+            hresult_to_camera_error(e)
+        })?;
+
+        initialized.store(true, Ordering::SeqCst);
     }
+    refcnt.fetch_add(1, Ordering::SeqCst);
     Ok(())
+}
+
+pub fn shutdown_mf() {
+    let refcnt = &*CAMERA_REFCNT;
+    if refcnt.fetch_sub(1, Ordering::SeqCst) == 1 {
+        let initialized = &*INITIALIZED;
+        if initialized.load(Ordering::SeqCst) {
+            unsafe {
+                let _ = MFShutdown();
+                CoUninitialize();
+            }
+            initialized.store(false, Ordering::SeqCst);
+        }
+    }
 }

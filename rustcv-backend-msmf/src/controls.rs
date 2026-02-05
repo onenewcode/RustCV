@@ -5,6 +5,7 @@
 //! implemented by all MSMF devices.
 
 use std::sync::Arc;
+use windows::core::GUID;
 use windows::Win32::Media::MediaFoundation::*;
 
 use rustcv_core::error::{CameraError, Result};
@@ -25,7 +26,37 @@ pub fn create_controls(source_reader: Arc<IMFSourceReader>) -> DeviceControls {
     }
 }
 
+/// Helper function to get the current media type from the source reader.
+unsafe fn get_current_media_type(
+    source_reader: &IMFSourceReader,
+) -> Option<IMFMediaType> {
+    source_reader
+        .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+        .ok()
+}
+
+/// Helper function to set a UINT64 attribute on the current media type.
+unsafe fn set_media_type_uint64(
+    source_reader: &IMFSourceReader,
+    guid: &GUID,
+    value: u64,
+) {
+    if let Some(media_type) = get_current_media_type(source_reader) {
+        let _ = media_type.SetUINT64(guid, value);
+    }
+}
+
+/// Helper function to get a UINT64 attribute from the current media type.
+unsafe fn get_media_type_uint64(
+    source_reader: &IMFSourceReader,
+    guid: &GUID,
+) -> Option<u64> {
+    get_current_media_type(source_reader)
+        .and_then(|media_type| media_type.GetUINT64(guid).ok())
+}
+
 /// A struct for controlling sensor-related properties of an MSMF camera.
+#[allow(clippy::arc_with_non_send_sync)]
 struct MsmfSensor {
     source_reader: Arc<IMFSourceReader>,
 }
@@ -40,12 +71,7 @@ impl SensorControl for MsmfSensor {
     /// control, which might not be the correct attribute for all devices.
     fn set_exposure(&self, value_us: u32) -> Result<()> {
         unsafe {
-            if let Ok(media_type) = self
-                .source_reader
-                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
-            {
-                let _ = media_type.SetUINT64(&MF_MT_VIDEO_LIGHTING, value_us as u64);
-            }
+            set_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING, value_us as u64);
         }
         Ok(())
     }
@@ -53,20 +79,15 @@ impl SensorControl for MsmfSensor {
     /// Gets the current exposure time of the camera sensor.
     fn get_exposure(&self) -> Result<u32> {
         unsafe {
-            if let Ok(media_type) = self
-                .source_reader
-                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
-            {
-                if let Ok(value) = media_type.GetUINT64(&MF_MT_VIDEO_LIGHTING) {
-                    return Ok(value as u32);
-                }
-            }
+            Ok(get_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING)
+                .map(|v| v as u32)
+                .unwrap_or(0))
         }
-        Ok(0)
     }
 }
 
 /// A struct for controlling lens-related properties of an MSMF camera.
+#[allow(clippy::arc_with_non_send_sync)]
 struct MsmfLens {
     source_reader: Arc<IMFSourceReader>,
 }
@@ -80,12 +101,7 @@ impl LensControl for MsmfLens {
     /// Note: This is a placeholder and uses a lighting attribute, which is likely incorrect.
     fn set_zoom(&self, zoom: u32) -> Result<()> {
         unsafe {
-            if let Ok(media_type) = self
-                .source_reader
-                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
-            {
-                let _ = media_type.SetUINT64(&MF_MT_VIDEO_LIGHTING, zoom as u64);
-            }
+            set_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING, zoom as u64);
         }
         Ok(())
     }
@@ -95,18 +111,14 @@ impl LensControl for MsmfLens {
     /// Note: This is a placeholder and uses a lighting attribute, which is likely incorrect.
     fn set_focus(&self, focus: u32) -> Result<()> {
         unsafe {
-            if let Ok(media_type) = self
-                .source_reader
-                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
-            {
-                let _ = media_type.SetUINT64(&MF_MT_VIDEO_LIGHTING, focus as u64);
-            }
+            set_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING, focus as u64);
         }
         Ok(())
     }
 }
 
 /// A struct for controlling system-level properties of an MSMF camera.
+#[allow(clippy::arc_with_non_send_sync)]
 struct MsmfSystem {
     source_reader: Arc<IMFSourceReader>,
 }
@@ -132,18 +144,10 @@ impl SystemControl for MsmfSystem {
     fn export_state(&self) -> Result<serde_json::Value> {
         use serde_json::json;
 
-        let mut exposure = None;
-
-        unsafe {
-            if let Ok(media_type) = self
-                .source_reader
-                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
-            {
-                if let Ok(value) = media_type.GetUINT64(&MF_MT_VIDEO_LIGHTING) {
-                    exposure = Some(value as u32);
-                }
-            }
-        }
+        let exposure = unsafe {
+            get_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING)
+                .map(|v| v as u32)
+        };
 
         Ok(json!({
             "backend": "msmf",

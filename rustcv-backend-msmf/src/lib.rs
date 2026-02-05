@@ -1,6 +1,6 @@
-//! This module provides the Microsoft Media Foundation (MSMF) backend for the `rustcv` library.
-//! It enables camera capture on Windows using the native MSMF API.
+#![allow(unexpected_cfgs)]
 
+#[cfg(all(windows, not(feature = "docs-only")))]
 pub mod controls;
 pub mod device;
 pub mod pixel_map;
@@ -18,7 +18,6 @@ use std::sync::Arc;
 pub struct MsmfDriver;
 
 impl Default for MsmfDriver {
-    /// Creates a new `MsmfDriver` instance.
     fn default() -> Self {
         Self::new()
     }

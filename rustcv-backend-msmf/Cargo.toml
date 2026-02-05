@@ -12,7 +12,7 @@ categories = ["hardware-support", "multimedia::video", "science::robotics"]
 [features]
 simulation = []
 
-[dependencies]
+[target.'cfg(target_os="windows")'.dependencies]
 rustcv-core = { version = "0.1", path = "../rustcv-core" }
 
 windows = { version = "0.62", features = [
@@ -34,7 +34,9 @@ bitflags = "2.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-[dev-dependencies]
+
+
+[target.'cfg(target_os="windows")'.dev-dependencies]
 minifb = "0.22"
 image = "0.24"
 tokio = { version = "1.0", features = ["full"] }

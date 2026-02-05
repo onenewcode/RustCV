@@ -10,30 +10,6 @@ use rustcv_core::traits::Driver;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    unsafe {
-        if !(INITIALIZED.load(Ordering::SeqCst)) {
-            if let Err(why) = unsafe {
-                CoInitializeEx(None, CO_INIT_APARTMENT_THREADED | CO_INIT_DISABLE_OLE1DDE)
-            } {
-                return Err(NokhwaError::InitializeError {
-                    backend: ApiBackend::MediaFoundation,
-                    error: why.to_string(),
-                });
-            }
-
-            if let Err(why) = unsafe { MFStartup(MF_API_VERSION, MFSTARTUP_NOSOCKET) } {
-                unsafe {
-                    CoUninitialize();
-                }
-                return Err(NokhwaError::InitializeError {
-                    backend: ApiBackend::MediaFoundation,
-                    error: why.to_string(),
-                });
-            }
-            INITIALIZED.store(true, Ordering::SeqCst);
-        }
-    }
-
     tracing_subscriber::fmt::init();
 
     println!("=== RustCV MSMF Backend Demo ===");
@@ -76,7 +52,6 @@ async fn main() -> Result<()> {
         .context("Failed to open camera")?;
 
     stream.start().await.context("Failed to start stream")?;
-
     println!("Stream started! Press ESC to exit.");
 
     let mut window = Window::new(
@@ -108,7 +83,6 @@ async fn main() -> Result<()> {
         window.update_with_buffer(&rgb_buffer, width, height)?;
 
         frame_count += 1;
-
         if last_time.elapsed() >= Duration::from_secs(1) {
             let fps = frame_count as f64 / last_time.elapsed().as_secs_f64();
 
@@ -180,11 +154,11 @@ fn yuyv_to_rgb32(src: &[u8], dest: &mut [u32], width: usize, height: usize) {
 
         let r0 = clip((298 * c0 + 409 * e + 128) >> 8);
         let g0 = clip((298 * c0 - 100 * d - 208 * e + 128) >> 8);
-        let b0 = clip((298 * c0 + 516 * d - 208 * e + 128) >> 8);
+        let b0 = clip((298 * c0 + 516 * d + 128) >> 8);
 
         let r1 = clip((298 * c1 + 409 * e + 128) >> 8);
         let g1 = clip((298 * c1 - 100 * d - 208 * e + 128) >> 8);
-        let b1 = clip((298 * c1 + 516 * d - 208 * e + 128) >> 8);
+        let b1 = clip((298 * c1 + 516 * d + 128) >> 8);
 
         let idx = i * 2;
         if idx + 1 < dest.len() {

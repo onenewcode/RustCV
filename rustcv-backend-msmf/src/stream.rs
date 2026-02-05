@@ -46,11 +46,75 @@ impl MsmfStream {
             width: fmt.width,
             height: fmt.height,
             format: fmt.format,
-            clock_sync: ClockSynchronizer::new(30), // TODO: Use actual FPS
+            clock_sync: ClockSynchronizer::new(30),
             is_streaming: false,
             sequence: 0,
             frame_data: Vec::new(),
         })
+    }
+
+    /// Helper function to convert HResult errors to CameraError.
+    fn hresult_to_camera_error(e: windows::core::Error) -> CameraError {
+        CameraError::Io(std::io::Error::other(e.to_string()))
+    }
+
+    /// Reads a sample from the source reader with retries.
+    unsafe fn read_sample_with_retry(&self) -> Result<(IMFSample, i64)> {
+        let mut stream_index = 0u32;
+        let mut flags = 0u32;
+        let mut timestamp = 0i64;
+        let mut sample = None;
+
+        for _ in 0..30 { // More retries
+            self.source_reader
+                .ReadSample(
+                    MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                    0u32,
+                    Some(&mut stream_index),
+                    Some(&mut flags),
+                    Some(&mut timestamp),
+                    Some(&mut sample),
+                )
+                .map_err(Self::hresult_to_camera_error)?;
+
+            if sample.is_some() {
+                break;
+            }
+
+            // Shorter sleep time for better responsiveness
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let sample = sample.ok_or_else(|| {
+            CameraError::Io(std::io::Error::other("No sample received"))
+        })?;
+
+        Ok((sample, timestamp))
+    }
+
+    /// Extracts frame data from a media buffer.
+    unsafe fn extract_frame_data(&mut self, media_buffer: &IMFMediaBuffer) -> Result<()> {
+        let mut data_ptr = std::ptr::null_mut();
+        let mut current_length = 0u32;
+        let mut max_length = 0u32;
+
+        media_buffer
+            .Lock(&mut data_ptr, Some(&mut max_length), Some(&mut current_length))
+            .map_err(Self::hresult_to_camera_error)?;
+
+        // Resize buffer if needed instead of always allocating new
+        if self.frame_data.len() < current_length as usize {
+            self.frame_data.resize(current_length as usize, 0);
+        }
+        // Copy data directly instead of using to_vec()
+        std::ptr::copy_nonoverlapping(
+            data_ptr as *const u8,
+            self.frame_data.as_mut_ptr(),
+            current_length as usize,
+        );
+
+        media_buffer.Unlock().map_err(Self::hresult_to_camera_error)?;
+        Ok(())
     }
 }
 
@@ -78,83 +142,17 @@ impl Stream for MsmfStream {
             return Err(CameraError::Io(std::io::Error::other("Stream not started")));
         }
 
-        let timestamp = unsafe {
-            let mut stream_index = 0u32;
-            let mut flags = 0u32;
-            let mut timestamp = 0i64;
-            let mut sample = None;
+        let (sample, timestamp) = unsafe { self.read_sample_with_retry()? };
 
-            // Retry reading a sample a few times, as it might not be immediately available.
-            for _ in 0..10 {
-                self.source_reader
-                    .ReadSample(
-                        MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
-                        0u32,
-                        Some(&mut stream_index),
-                        Some(&mut flags),
-                        Some(&mut timestamp),
-                        Some(&mut sample),
-                    )
-                    .map_err(|e| {
-                        CameraError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        ))
-                    })?;
-
-                if sample.is_some() {
-                    break;
-                }
-
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-
-            let sample = sample
-                .ok_or_else(|| CameraError::Io(std::io::Error::other("No sample received")))?;
-
-            // Get the media buffer from the sample.
-            let media_buffer = sample.GetBufferByIndex(0).map_err(|e| {
-                CameraError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-
-            let mut data_ptr = std::ptr::null_mut();
-            let mut current_length = 0u32;
-            let mut max_length = 0u32;
-
-            // Lock the buffer to access the frame data.
-            media_buffer
-                .Lock(
-                    &mut data_ptr,
-                    Some(&mut max_length),
-                    Some(&mut current_length),
-                )
-                .map_err(|e| {
-                    CameraError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                })?;
-
-            // Copy the frame data into our own buffer.
-            self.frame_data =
-                std::slice::from_raw_parts(data_ptr as *const u8, current_length as usize).to_vec();
-
-            // Unlock the buffer.
-            media_buffer.Unlock().map_err(|e| {
-                CameraError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
-
-            timestamp
+        let media_buffer = unsafe {
+            sample
+                .GetBufferByIndex(0)
+                .map_err(Self::hresult_to_camera_error)?
         };
 
+        unsafe { self.extract_frame_data(&media_buffer)? };
+
         let arrival_time = Instant::now();
-        // The MSMF timestamp is in 100-nanosecond units.
         let hw_ns = (timestamp as u64) * 100;
         let synced_time = self.clock_sync.correct(hw_ns, arrival_time);
 
