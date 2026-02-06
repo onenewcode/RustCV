@@ -1,4 +1,5 @@
-#[cfg(windows)]
+#![cfg(target_os = "windows")]
+
 pub mod controls;
 pub mod device;
 pub mod pixel_map;

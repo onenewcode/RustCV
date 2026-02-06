@@ -17,7 +17,6 @@ use crate::stream::MsmfStream;
 static INITIALIZED: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
 static CAMERA_REFCNT: LazyLock<Arc<AtomicUsize>> = LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
 
-
 fn hresult_to_camera_error(e: HResultError) -> CameraError {
     CameraError::Io(std::io::Error::other(e.to_string()))
 }
@@ -28,9 +27,14 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
     unsafe {
         let mut attributes = None;
         MFCreateAttributes(&mut attributes, 1).map_err(hresult_to_camera_error)?;
-        let attributes = attributes.ok_or_else(|| CameraError::Io(std::io::Error::other("Failed to create attributes")))?;
+        let attributes = attributes
+            .ok_or_else(|| CameraError::Io(std::io::Error::other("Failed to create attributes")))?;
 
-        attributes.SetGUID(&MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID)
+        attributes
+            .SetGUID(
+                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+            )
             .map_err(hresult_to_camera_error)?;
 
         let mut pp_devices: MaybeUninit<*mut Option<IMFActivate>> = MaybeUninit::uninit();
@@ -48,19 +52,25 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>> {
             Vec::new()
         };
 
-        Ok(devices.into_iter().filter_map(|device| {
-            let name = get_attribute_string(&device, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
-            if name.is_empty() {
-                None
-            } else {
-                Some(DeviceInfo {
-                    name,
-                    id: get_attribute_string(&device, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK),
-                    backend: "MSMF".to_string(),
-                    bus_info: None,
-                })
-            }
-        }).collect())
+        Ok(devices
+            .into_iter()
+            .filter_map(|device| {
+                let name = get_attribute_string(&device, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME);
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(DeviceInfo {
+                        name,
+                        id: get_attribute_string(
+                            &device,
+                            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
+                        ),
+                        backend: "MSMF".to_string(),
+                        bus_info: None,
+                    })
+                }
+            })
+            .collect())
     }
 }
 
@@ -86,7 +96,6 @@ unsafe fn get_attribute_string(attr: &IMFActivate, guid: GUID) -> String {
 }
 
 /// Opens a camera device by its ID and applies the given configuration.
-#[allow(clippy::arc_with_non_send_sync)]
 pub fn open(id: &str, config: CameraConfig) -> Result<(Box<dyn Stream>, DeviceControls)> {
     initialize_mf()?;
 
@@ -116,7 +125,8 @@ pub fn open(id: &str, config: CameraConfig) -> Result<(Box<dyn Stream>, DeviceCo
 unsafe fn create_source_reader(id: &str) -> Result<IMFSourceReader> {
     let mut attributes = None;
     MFCreateAttributes(&mut attributes, 2).map_err(hresult_to_camera_error)?;
-    let attributes = attributes.ok_or_else(|| CameraError::Io(std::io::Error::other("Failed to create attributes")))?;
+    let attributes = attributes
+        .ok_or_else(|| CameraError::Io(std::io::Error::other("Failed to create attributes")))?;
 
     attributes
         .SetGUID(
@@ -294,7 +304,8 @@ fn calculate_format_score(config: &CameraConfig, w: u32, h: u32, fmt: PixelForma
     // Calculate distance from preferred resolutions if no exact match
     // This penalizes formats that are far from the requested resolution
     let resolution_distance = if resolution_score == 0 {
-        config.resolution_req
+        config
+            .resolution_req
             .iter()
             .map(|(req_w, req_h, _)| {
                 let w_diff = (w as i32 - *req_w as i32).abs();
