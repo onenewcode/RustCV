@@ -37,7 +37,7 @@ impl MsmfStream {
     ) -> Result<Self> {
         let stride = (fmt.width * fmt.format.bpp_estimate() / 8) as usize;
         let estimated_size = stride * fmt.height as usize;
-        
+
         Ok(Self {
             source_reader,
             width: fmt.width,
@@ -78,9 +78,8 @@ impl MsmfStream {
             }
         }
 
-        let sample = sample.ok_or_else(|| {
-            CameraError::Io(std::io::Error::other("No sample received"))
-        })?;
+        let sample =
+            sample.ok_or_else(|| CameraError::Io(std::io::Error::other("No sample received")))?;
 
         Ok((sample, timestamp))
     }
@@ -91,13 +90,18 @@ impl MsmfStream {
         let mut max_length = 0u32;
 
         media_buffer
-            .Lock(&mut data_ptr, Some(&mut max_length), Some(&mut current_length))
+            .Lock(
+                &mut data_ptr,
+                Some(&mut max_length),
+                Some(&mut current_length),
+            )
             .map_err(Self::hresult_to_camera_error)?;
 
         if self.frame_data.capacity() < current_length as usize {
-            self.frame_data.reserve(current_length as usize - self.frame_data.capacity());
+            self.frame_data
+                .reserve(current_length as usize - self.frame_data.capacity());
         }
-        
+
         self.frame_data.set_len(current_length as usize);
         std::ptr::copy_nonoverlapping(
             data_ptr as *const u8,
@@ -105,7 +109,9 @@ impl MsmfStream {
             current_length as usize,
         );
 
-        media_buffer.Unlock().map_err(Self::hresult_to_camera_error)?;
+        media_buffer
+            .Unlock()
+            .map_err(Self::hresult_to_camera_error)?;
         Ok(())
     }
 }
