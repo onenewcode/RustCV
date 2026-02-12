@@ -58,9 +58,8 @@ pub fn create_controls(source_reader: Arc<IMFSourceReader>) -> DeviceControls {
 ///
 /// This function is unsafe as it calls Windows Media Foundation APIs
 /// that require unsafe context.
-unsafe fn get_current_media_type(
-    source_reader: &IMFSourceReader,
-) -> Option<IMFMediaType> {
+#[inline]
+unsafe fn get_current_media_type(source_reader: &IMFSourceReader) -> Option<IMFMediaType> {
     source_reader
         .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
         .ok()
@@ -81,22 +80,26 @@ unsafe fn get_current_media_type(
 ///
 /// This function is unsafe as it calls Windows Media Foundation APIs
 /// that require unsafe context.
-unsafe fn set_media_type_uint64(
-    source_reader: &IMFSourceReader,
-    guid: &GUID,
-    value: u64,
-) {
+#[inline]
+unsafe fn set_media_type_uint64(source_reader: &IMFSourceReader, guid: &GUID, value: u64) {
     if let Some(media_type) = get_current_media_type(source_reader) {
         let _ = media_type.SetUINT64(guid, value);
     }
 }
 
-unsafe fn get_media_type_uint64(
-    source_reader: &IMFSourceReader,
-    guid: &GUID,
-) -> Option<u64> {
-    get_current_media_type(source_reader)
-        .and_then(|media_type| media_type.GetUINT64(guid).ok())
+/// Gets a UINT64 attribute from the current media type.
+///
+/// # Arguments
+///
+/// * `source_reader` - Reference to the IMFSourceReader interface.
+/// * `guid` - The GUID of the attribute to retrieve.
+///
+/// # Returns
+///
+/// `Some(u64)` if the attribute exists, `None` otherwise.
+#[inline]
+unsafe fn get_media_type_uint64(source_reader: &IMFSourceReader, guid: &GUID) -> Option<u64> {
+    get_current_media_type(source_reader).and_then(|media_type| media_type.GetUINT64(guid).ok())
 }
 
 /// MSMF implementation of sensor controls.
@@ -125,9 +128,11 @@ impl SensorControl for MsmfSensor {
 
     fn get_exposure(&self) -> Result<u32> {
         unsafe {
-            Ok(get_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING)
-                .map(|v| v as u32)
-                .unwrap_or(DEFAULT_EXPOSURE_US))
+            Ok(
+                get_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING)
+                    .map(|v| v as u32)
+                    .unwrap_or(DEFAULT_EXPOSURE_US),
+            )
         }
     }
 }
@@ -191,8 +196,7 @@ impl SystemControl for MsmfSystem {
         use serde_json::json;
 
         let exposure = unsafe {
-            get_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING)
-                .map(|v| v as u32)
+            get_media_type_uint64(&self.source_reader, &MF_MT_VIDEO_LIGHTING).map(|v| v as u32)
         };
 
         Ok(json!({

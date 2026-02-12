@@ -101,17 +101,17 @@ impl MsmfStream {
             )
             .map_err(Self::hresult_to_camera_error)?;
 
-        if self.frame_data.capacity() < current_length as usize {
-            self.frame_data
-                .reserve(current_length as usize - self.frame_data.capacity());
+        let len = current_length as usize;
+
+        // Optimize memory allocation: only reserve if necessary
+        if self.frame_data.capacity() < len {
+            // Double capacity for better amortized performance
+            self.frame_data.reserve(len.max(self.frame_data.capacity()));
         }
 
-        self.frame_data.set_len(current_length as usize);
-        std::ptr::copy_nonoverlapping(
-            data_ptr as *const u8,
-            self.frame_data.as_mut_ptr(),
-            current_length as usize,
-        );
+        // Update length and copy data in one operation
+        self.frame_data.set_len(len);
+        std::ptr::copy_nonoverlapping(data_ptr as *const u8, self.frame_data.as_mut_ptr(), len);
 
         media_buffer
             .Unlock()
