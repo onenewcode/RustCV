@@ -106,7 +106,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // 4. 清理 (Drop 会自动处理，但显式调用更规范)
+    // 4. 清理 ( 会自动处理，但显式调用更规范)
     highgui::destroy_all_windows()?;
 
     Ok(())

@@ -1,226 +1,75 @@
-use futures::Stream;
-use std::collections::VecDeque;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Waker};
-use windows::{
-    core::*, Win32::Foundation::*, Win32::Media::MediaFoundation::*, Win32::System::Com::*,
+use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Instant;
+use tokio::sync::Notify;
+
+use windows::core::{implement, IUnknown, Interface, Result, HRESULT};
+use windows::Win32::Media::MediaFoundation::{
+    IMF2DBuffer2, IMFMediaEvent, IMFMediaSource, IMFSample, IMFSourceReader,
+    IMFSourceReaderCallback, IMFSourceReaderCallback2, IMFSourceReaderCallback2_Impl,
+    IMFSourceReaderCallback_Impl, MF2DBuffer_LockFlags_Read, MFCreateAttributes,
+    MFCreateSourceReaderFromMediaSource, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+    MF_SOURCE_READER_ASYNC_CALLBACK, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
 };
 
-// --- 全局初始化 ---
-static MF_STARTUP: std::sync::Once = std::sync::Once::new();
-
-fn ensure_mf_initialized() {
-    MF_STARTUP.call_once(|| unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        MFStartup(MF_VERSION, MFSTARTUP_FULL).expect("MFStartup Failed");
-    });
+// =============================================================================
+// 1. 共享状态
+// =============================================================================
+struct SharedState {
+    sample_slot: Mutex<Option<IMFSample>>,
+    timestamp: AtomicI64,
+    notifier: Notify,
+    is_running: AtomicBool,
 }
 
-// --- 高性能 Frame 包装 ---
-
-pub struct VideoFrame {
-    pub width: u32,
-    pub height: u32,
-    pub stride: i32,
-    pub timestamp: i64,
-    data: IMFSample,
-    buffer: IMFMediaBuffer,
-    ptr: *mut u8,
-    pub length: u32,
+// =============================================================================
+// 2. 生产者：MsmfCallback (修正弱引用和逻辑)
+// =============================================================================
+#[implement(IMFSourceReaderCallback, IMFSourceReaderCallback2)]
+struct MsmfCallback {
+    // 使用 OnceLock 存储 Reader 的弱引用，防止循环引用导致内存泄漏
+    reader: OnceLock<Weak<IMFSourceReader>>,
+    shared: Arc<SharedState>,
 }
 
-impl VideoFrame {
-    /// 获取原始切片。注意：由于 Stride 存在，每一行末尾可能有填充字节
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.length as usize) }
-    }
-}
-
-unsafe impl Send for VideoFrame {}
-
-impl Drop for VideoFrame {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.buffer.Unlock();
+impl MsmfCallback {
+    fn new(shared: Arc<SharedState>) -> Self {
+        Self {
+            reader: OnceLock::new(),
+            shared,
         }
     }
 }
 
-// --- 核心状态管理 ---
-
-struct StreamState {
-    queue: VecDeque<VideoFrame>,
-    waker: Option<Waker>,
-    closed: bool,
-    // 限制队列长度防止 OOM (Backpressure)
-    max_capacity: usize,
-}
-
-#[implement(IMFSourceReaderCallback)]
-struct ReaderCallback {
-    state: Arc<Mutex<StreamState>>,
-    // 使用原子变量快速检查状态，减少锁请求
-    is_active: Arc<AtomicBool>,
-}
-
-impl IMFSourceReaderCallback_Impl for ReaderCallback {
+impl IMFSourceReaderCallback_Impl for MsmfCallback {
     fn OnReadSample(
         &self,
-        hr_status: HRESULT,
-        _stream_index: u32,
-        _stream_flags: u32,
-        timestamp: i64,
+        hr: HRESULT,
+        _: u32,
+        _: u32,
+        ts: i64,
         sample: Option<&IMFSample>,
     ) -> Result<()> {
-        if hr_status.is_err() || !self.is_active.load(Ordering::Relaxed) {
+        // 1. 检查运行状态和错误码
+        if !self.shared.is_running.load(Ordering::Acquire) || hr.is_err() {
             return Ok(());
         }
 
+        // 2. 更新 Sample 槽位并通知消费者
         if let Some(s) = sample {
-            unsafe {
-                // 1. 提取缓冲区
-                let buffer = s.ConvertToContiguousBuffer()?;
-                let mut ptr = std::ptr::null_mut();
-                let mut length = 0;
-                buffer.Lock(&mut ptr, None, Some(&mut length))?;
-
-                // 2. 构造 Frame (此处可根据需要解析具体分辨率/Stride)
-                let frame = VideoFrame {
-                    width: 0, // 建议从媒体类型中预先获取
-                    height: 0,
-                    stride: 0,
-                    timestamp,
-                    data: s.clone(),
-                    buffer,
-                    ptr,
-                    length,
-                };
-
-                // 3. 入队并唤醒异步任务
-                let mut state = self.state.lock().unwrap();
-                if state.queue.len() < state.max_capacity {
-                    state.queue.push_back(frame);
-                    if let Some(waker) = state.waker.take() {
-                        waker.wake();
-                    }
-                }
-                // 如果队列满了，我们选择丢弃老帧或停止请求（取决于业务需求）
+            {
+                let mut slot = self.shared.sample_slot.lock().unwrap();
+                *slot = Some(s.clone());
             }
+            self.shared.timestamp.store(ts, Ordering::Release);
+            self.shared.notifier.notify_waiters();
         }
-        Ok(())
-    }
 
-    fn OnFlush(&self, _: u32) -> Result<()> {
-        Ok(())
-    }
-    fn OnEvent(&self, _: u32, _: Option<&IMFMediaEvent>) -> Result<()> {
-        Ok(())
-    }
-}
-
-// --- 异步流对象 ---
-
-pub struct VisionStream {
-    reader: IMFSourceReader,
-    state: Arc<Mutex<StreamState>>,
-    is_active: Arc<AtomicBool>,
-}
-
-impl VisionStream {
-    pub fn new(index: u32, max_buffer: usize) -> Result<Self> {
-        ensure_mf_initialized();
-
-        unsafe {
-            // 设备枚举
-            let mut attributes: Option<IMFAttributes> = None;
-            MFCreateAttributes(&mut attributes, 1)?;
-            let attributes = attributes.unwrap();
-            attributes.SetGUID(
-                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-            )?;
-
-            let mut devices_ptr = std::ptr::null_mut();
-            let mut count = 0;
-            MFEnumDeviceSources(&attributes, &mut devices_ptr, &mut count)?;
-            let devices = std::slice::from_raw_parts(devices_ptr, count as usize);
-            let activate = devices
-                .get(index as usize)
-                .ok_or(Error::from(E_FAIL))?
-                .as_ref()
-                .unwrap();
-
-            // 状态初始化
-            let state = Arc::new(Mutex::new(StreamState {
-                queue: VecDeque::with_capacity(max_buffer),
-                waker: None,
-                closed: false,
-                max_capacity: max_buffer,
-            }));
-            let is_active = Arc::new(AtomicBool::new(true));
-
-            // 回调配置
-            let callback_impl = ReaderCallback {
-                state: state.clone(),
-                is_active: is_active.clone(),
-            };
-            let callback: IMFSourceReaderCallback = callback_impl.into();
-
-            let mut reader_attrs: Option<IMFAttributes> = None;
-            MFCreateAttributes(&mut reader_attrs, 2)?;
-            let reader_attrs = reader_attrs.unwrap();
-            reader_attrs.SetUnknown(&MF_SOURCE_READER_ASYNC_CALLBACK, &callback)?;
-            // 允许硬件转换，提高性能
-            reader_attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-
-            let source: IMFMediaSource = activate.ActivateObject()?;
-            let mut reader: Option<IMFSourceReader> = None;
-            MFCreateSourceReaderFromMediaSource(&source, Some(&reader_attrs), &mut reader)?;
-            let reader = reader.unwrap();
-
-            // 强制设置输出格式为 RGB32 或 NV12 以保证兼容性
-            let mut media_type: Option<IMFMediaType> = None;
-            MFCreateMediaType(&mut media_type)?;
-            let media_type = media_type.unwrap();
-            media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            media_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
-            reader.SetCurrentMediaType(
-                MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
-                None,
-                &media_type,
-            )?;
-
-            // 启动首个采样
-            reader.ReadSample(
-                MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
-                0,
-                None,
-                None,
-                None,
-                None,
-            )?;
-
-            Ok(Self {
-                reader,
-                state,
-                is_active,
-            })
-        }
-    }
-}
-
-impl Stream for VisionStream {
-    type Item = VideoFrame;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut state = self.state.lock().unwrap();
-
-        if let Some(frame) = state.queue.pop_front() {
-            // 立即发出下一个请求以维持流水线
+        // 3. 异步请求下一帧（极致转发的关键）
+        if let Some(reader) = self.reader.get().and_then(|w| w.upgrade()) {
             unsafe {
-                let _ = self.reader.ReadSample(
+                let _ = reader.ReadSample(
                     MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
                     0,
                     None,
@@ -229,21 +78,201 @@ impl Stream for VisionStream {
                     None,
                 );
             }
-            Poll::Ready(Some(frame))
-        } else {
-            if state.closed {
-                Poll::Ready(None)
-            } else {
-                state.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
         }
+        Ok(())
+    }
+
+    fn OnFlush(&self, _: u32) -> Result<()> {
+        Ok(())
+    }
+    fn OnEvent(&self, _: u32, _: &IMFMediaEvent) -> Result<()> {
+        Ok(())
     }
 }
 
-impl Drop for VisionStream {
-    fn drop(&mut self) {
-        self.is_active.store(false, Ordering::SeqCst);
-        // 实际清理逻辑通常由 MF 的异步机制处理
+impl IMFSourceReaderCallback2_Impl for MsmfCallback {
+    fn OnTransformChange(&self) -> Result<()> {
+        Ok(())
+    }
+    fn OnStreamError(&self, _: u32, _: HRESULT) -> Result<()> {
+        Ok(())
+    }
+}
+
+// =============================================================================
+// 3. 消费者：MsmfStream (修正初始化顺序)
+// =============================================================================
+pub struct MsmfStream {
+    source_reader: IMFSourceReader,
+    shared: Arc<SharedState>,
+    linear_buffer: Vec<u8>,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    line_width_bytes: usize,
+    sequence: u64,
+    clock_sync: ClockSynchronizer,
+}
+
+impl MsmfStream {
+    pub fn new(
+        media_source: &IMFMediaSource, // 传入 MediaSource 而不是 Reader
+        fmt: &super::device::NegotiatedFormat,
+    ) -> Result<Self> {
+        let bpp = fmt.format.bpp_estimate();
+        let line_width_bytes = (fmt.width * bpp / 8) as usize;
+        let total_size = line_width_bytes * fmt.height as usize;
+
+        // A. 初始化共享状态
+        let shared = Arc::new(SharedState {
+            sample_slot: Mutex::new(None),
+            timestamp: AtomicI64::new(0),
+            notifier: Notify::new(),
+            is_running: AtomicBool::new(false),
+        });
+
+        // B. 先创建回调对象
+        let callback_impl = MsmfCallback::new(shared.clone());
+        let callback_interface: IMFSourceReaderCallback = callback_impl.clone().into();
+
+        // C. 配置属性，绑定回调以开启异步模式
+        let attributes = unsafe {
+            let attr = MFCreateAttributes(2)?;
+            attr.SetUnknown(
+                &MF_SOURCE_READER_ASYNC_CALLBACK,
+                &callback_interface.cast::<IUnknown>()?,
+            )?;
+            attr.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+            attr
+        };
+
+        // D. 创建 SourceReader
+        let source_reader =
+            unsafe { MFCreateSourceReaderFromMediaSource(media_source, Some(&attributes))? };
+
+        // E. 注入 Reader 的弱引用到回调中，完成闭环
+        let _ = callback_impl
+            .reader
+            .set(Arc::downgrade(&Arc::new(source_reader.clone())));
+
+        Ok(Self {
+            source_reader,
+            shared,
+            linear_buffer: vec![0u8; total_size],
+            width: fmt.width,
+            height: fmt.height,
+            format: fmt.format,
+            line_width_bytes,
+            sequence: 0,
+            clock_sync: ClockSynchronizer::new(30),
+        })
+    }
+}
+
+#[async_trait]
+impl Stream for MsmfStream {
+    async fn start(&mut self) -> Result<()> {
+        self.shared.is_running.store(true, Ordering::Release);
+        unsafe {
+            self.source_reader.ReadSample(
+                MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        self.shared.is_running.store(false, Ordering::Release);
+        unsafe {
+            let _ = self
+                .source_reader
+                .Flush(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32);
+        }
+        Ok(())
+    }
+
+    async fn next_frame(&mut self) -> Result<Frame<'_>> {
+        let sample = loop {
+            // 1. 等待信号
+            self.shared.notifier.notified().await;
+
+            // 2. 尝试从槽位取出采样
+            let mut slot = self.shared.sample_slot.lock().unwrap();
+            if let Some(s) = slot.take() {
+                // take() 可以减少对旧 Sample 的持有时间
+                break s;
+            }
+            // 如果被唤醒但没拿到 Sample，继续循环（应对虚假唤醒）
+        };
+
+        let ts_raw = self.shared.timestamp.load(Ordering::Acquire);
+
+        // 3. 数据平铺拷贝逻辑
+        unsafe {
+            let buffer = sample.GetBufferByIndex(0)?;
+            if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer2>() {
+                let (mut pb_scanline, mut l_pitch) = (std::ptr::null_mut(), 0);
+                let (mut pb_start, mut cb_buf) = (std::ptr::null_mut(), 0);
+                buffer2d.Lock2DSize(
+                    MF2DBuffer_LockFlags_Read,
+                    &mut pb_scanline,
+                    &mut l_pitch,
+                    &mut pb_start,
+                    &mut cb_buf,
+                )?;
+
+                let src_stride = l_pitch as usize;
+                if src_stride == self.line_width_bytes {
+                    std::ptr::copy_nonoverlapping(
+                        pb_scanline,
+                        self.linear_buffer.as_mut_ptr(),
+                        self.linear_buffer.len(),
+                    );
+                } else {
+                    for y in 0..self.height as usize {
+                        std::ptr::copy_nonoverlapping(
+                            pb_scanline.add(y * src_stride),
+                            self.linear_buffer
+                                .as_mut_ptr()
+                                .add(y * self.line_width_bytes),
+                            self.line_width_bytes,
+                        );
+                    }
+                }
+                let _ = buffer2d.Unlock2D();
+            } else {
+                let (mut ptr, mut len) = (std::ptr::null_mut(), 0);
+                buffer.Lock(&mut ptr, None, Some(&mut len))?;
+                std::ptr::copy_nonoverlapping(
+                    ptr,
+                    self.linear_buffer.as_mut_ptr(),
+                    (len as usize).min(self.linear_buffer.len()),
+                );
+                let _ = buffer.Unlock();
+            }
+        }
+
+        let hw_ns = (ts_raw as u64) * 100;
+        self.sequence += 1;
+
+        Ok(Frame {
+            data: &self.linear_buffer,
+            width: self.width,
+            height: self.height,
+            stride: self.line_width_bytes,
+            format: self.format,
+            sequence: self.sequence,
+            timestamp: Timestamp {
+                hw_raw_ns: hw_ns,
+                system_synced: self.clock_sync.correct(hw_ns, Instant::now()),
+            },
+            metadata: FrameMetadata::default(),
+            backend_handle: &MSMF_HANDLE_INSTANCE,
+        })
     }
 }

@@ -130,10 +130,13 @@ mod windows_impl {
     }
 
     fn yuyv_to_rgb32(src: &[u8], dest: &mut [u32], width: usize, height: usize) {
+        // 【作用1】安全检查：确保数据长度和分辨率匹配
+        // YUYV 是每像素 2 字节，RGB32 是每像素 1 个 u32
         let expected_src_len = width * height * 2;
         let expected_dest_len = width * height;
 
         if src.len() < expected_src_len || dest.len() < expected_dest_len {
+            // 在生产环境中应该返回 Result，这里简单打印错误或直接 panic
             eprintln!(
                 "Error: Buffer size mismatch! Expected {} bytes, got {}",
                 expected_src_len,
@@ -155,14 +158,17 @@ mod windows_impl {
             let d = u;
             let e = v;
 
+            // Pixel 1
             let r0 = clip((298 * c0 + 409 * e + 128) >> 8);
             let g0 = clip((298 * c0 - 100 * d - 208 * e + 128) >> 8);
             let b0 = clip((298 * c0 + 516 * d + 128) >> 8);
 
+            // Pixel 2
             let r1 = clip((298 * c1 + 409 * e + 128) >> 8);
             let g1 = clip((298 * c1 - 100 * d - 208 * e + 128) >> 8);
             let b1 = clip((298 * c1 + 516 * d + 128) >> 8);
 
+            // 写入 Buffer (0x00RRGGBB)
             let idx = i * 2;
             if idx + 1 < dest.len() {
                 dest[idx] = (r0 << 16) | (g0 << 8) | b0;
@@ -170,7 +176,6 @@ mod windows_impl {
             }
         }
     }
-
     #[inline]
     fn clip(val: i32) -> u32 {
         if val < 0 {
